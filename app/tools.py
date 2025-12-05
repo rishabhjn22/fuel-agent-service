@@ -1,144 +1,256 @@
-import os
+# tools.py
+import math
 import httpx
 from . import config
 
-# FIX: Define build_headers here to avoid 'config' error
-def build_headers(user_agent: str | None = None, device_os: str | None = None) -> dict:
-    ua = user_agent or "RXODrive/476/ios"
-    dos = device_os or "ios"
+DEFAULT_RADIUS_METERS = 321869  # ~200 miles
+
+# ---------- Helper functions (NOT tools) ----------
+
+def _calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Internal helper: haversine distance in miles between two lat/lon points.
+    """
+    if any(x is None for x in [lat1, lon1, lat2, lon2]):
+        return 9999.0
+
+    try:
+        R = 3958.8  # Earth radius in miles
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(dlon / 2) ** 2
+        )
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return round(R * c, 2)
+    except Exception:
+        return 9999.0
+
+
+def _build_headers() -> dict:
+    """
+    Internal helper: Build HTTP headers for RXO APIs using env config.
+    """
     headers = {
         "accept": "application/json",
-        "content-type": "application/json;charset=UTF-8",
-        "user-agent": ua,
-        "deviceos": dos,
+        "user-agent": "FuelFinder/4.0",
+        "deviceos": "web",
     }
-    # Load from env
-    if os.getenv("RXO_API_KEY"):
-        headers["x-apikey"] = os.getenv("RXO_API_KEY")
-    if os.getenv("RXO_BEARER_TOKEN"):
-        token = os.getenv("RXO_BEARER_TOKEN")
-        headers["authorization"] = token if token.startswith("Bearer ") else f"Bearer {token}"
+    if config.RXO_API_KEY:
+        headers["x-apikey"] = config.RXO_API_KEY
+    if config.RXO_BEARER_TOKEN:
+        token = config.RXO_BEARER_TOKEN
+        headers["authorization"] = (
+            token if token.startswith("Bearer ") else f"Bearer {token}"
+        )
     return headers
 
-async def get_coordinates_from_city(city_name: str):
+
+def _parse_station_data(
+    item: dict, user_lat: float, user_lon: float, amenities_requested: bool
+) -> dict:
+    """
+    Internal helper: normalize one station into a compact JSON object.
+    Handles priority sorting and "next step" recommendation text.
+    """
+    # 1. Parse station coordinates & distance
+    station_lat, station_lon = None, None
+    geo_str = item.get("locationGeo")
+    if geo_str and "," in geo_str:
+        try:
+            parts = geo_str.split(",")
+            station_lat = float(parts[0])
+            station_lon = float(parts[1])
+        except Exception:
+            pass
+
+    dist = _calculate_distance(user_lat, user_lon, station_lat, station_lon)
+
+    # 2. Real-time capability flag
+    loc_cd = item.get("locationCd")
+    has_realtime = bool(loc_cd)
+
+    # 3. Basic “features” + next step hint
+    features = []
+    next_step = "Basic fuel station."
+
+    if amenities_requested:
+        if has_realtime:
+            features.append("Real-time Amenities (Parking/Food)")
+            next_step = (
+                f"**RECOMMENDED**: Call get_amenities_details("
+                f"location_id={item.get('locationId')}, location_cd=\"{loc_cd}\")"
+            )
+        else:
+            next_step = "No real-time amenities data for this station."
+    else:
+        if has_realtime:
+            features.append("Real-time amenities available")
+            next_step = (
+                "Optional: Call get_amenities_details if user asks for specifics."
+            )
+
+    return {
+        "name": item.get("name"),
+        "is_priority": has_realtime,  # used later for sorting
+        "distance_miles": dist,
+        "location": f"{item.get('city')}, {item.get('state')}",
+        "financials": {
+            "driver_price": f"${(item.get('customerPrice') or 0):.2f}",
+            "savings": f"${(item.get('savings') or 0):.2f}",
+        },
+        "features": ", ".join(features),
+        "maps_url": f"https://www.google.com/maps/search/?api=1&query={station_lat},{station_lon}",
+        "NEXT_STEP": next_step,
+        "id": item.get("locationId"),
+    }
+
+
+# ---------- ADK Function Tools (these 3 are exposed to the Agent) ----------
+
+def get_coordinates_from_city(city_name: str) -> dict:
+    """
+    Convert a city name to GPS coordinates.
+
+    Use this when the user mentions a city like "Chicago" instead of giving
+    raw latitude/longitude. Returns:
+      - latitude (float)
+      - longitude (float)
+      - display_name (string)
+    """
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": city_name, "format": "json", "limit": 1}
     try:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {"q": city_name, "format": "json", "limit": 1}
-        headers = {"User-Agent": "FuelFinderApp/1.0"}
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, params=params, headers=headers)
-            data = resp.json()
-            if data:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                url, params=params, headers={"User-Agent": "FuelFinder/4.0"}
+            )
+            if resp.status_code == 200 and resp.json():
+                data = resp.json()[0]
                 return {
-                    "latitude": float(data[0]["lat"]),
-                    "longitude": float(data[0]["lon"]),
-                    "display_name": data[0]["display_name"]
+                    "latitude": float(data["lat"]),
+                    "longitude": float(data["lon"]),
+                    "display_name": data["display_name"],
                 }
-            return {"error": "City not found"}
-    except Exception:
-        return {"error": "Geocoding failed"}
-
-async def search_amenities(latitude: float, longitude: float, radius: int = 5000, userId: str = "user", limit: int = 10, user_agent: str = None, device_os: str = None):
-    params = {"latitude": latitude, "longitude": longitude, "radius": radius, "amenitiesType": 1, "userId": userId}
-    print(f"🔍 Searching: {params}")
-
-    try:
-        headers = build_headers(user_agent, device_os)
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(config.AMENITIES_API, params=params, headers=headers)
-            
-            items = []
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, dict) and "data" in data:
-                    items = data["data"]
-                elif isinstance(data, list):
-                    items = data
-            
-            enriched = []
-            for it in items[:limit]:
-                # ... (Keep Geo parsing) ...
-                
-                # 🔴 FIX 2: ROBUST FEATURE PARSING
-                # Some APIs return "true" (string) or true (bool) or 1 (int)
-                def is_true(val):
-                    return str(val).lower() in ["true", "1", "yes"] or val is True
-
-                features = []
-                
-                # Check ALL possible parking flags
-                if is_true(it.get("hasRestaurants")): features.append("Food")
-                if is_true(it.get("hasFuelStation")): features.append("Fuel")
-                if is_true(it.get("hasParking")) or is_true(it.get("hasTruckParking")): 
-                    features.append("Parking (Availability Unknown)") # <--- CHANGED
-                if is_true(it.get("hasShowers")): 
-                    features.append("Showers (Availability Unknown)") # <--- CHANGED
-                if is_true(it.get("hasRestaurants")) or is_true(it.get("hasFood")): features.append("Food")
-                if is_true(it.get("hasCatScale")): features.append("Scale")
-
-                # If the list is empty, let's look at the 'amenities' string field if it exists
-                # e.g. "Fuel, Parking, Subway"
-                amenities_str = str(it.get("amenities", "") or "")
-                if "Parking" in amenities_str and "Parking" not in features:
-                    features.append("Parking")
-                if "Shower" in amenities_str and "Showers" not in features:
-                    features.append("Showers")
-
-                enriched.append({
-                    "locationId": it.get("locationId"),
-                    "name": it.get("name"),
-                    # ... (Keep other fields) ...
-                    "features": features, 
-                    # ...
-                })
-
-            return enriched
-            
+            return {"error": f"City '{city_name}' not found."}
     except Exception as e:
-        print(f"⚠️ API Error: {e}")
-        # FALLBACK DATA: Ensure "Parking" is in the features list!
-        return [
-            {
-                "locationId": 999,
-                "name": "Mock Station (Parking Test)",
-                "price": 3.50,
-                "features": ["Fuel", "Parking", "Showers"], # <--- CRITICAL
-                "latitude": latitude + 0.01,
-                "longitude": longitude + 0.01
-            }
-        ]
+        return {"error": f"Geocoding error: {str(e)}"}
 
-async def get_amenities_info(locationId: int, user_agent: str | None = None, device_os: str | None = None):
-    params = {"locationId": locationId}
+
+def search_amenities(
+    latitude: float,
+    longitude: float,
+    radius: int = DEFAULT_RADIUS_METERS,
+    amenities_required: bool = False,
+) -> list[dict]:
+    """
+    Search for nearby fuel stations around the given GPS point.
+
+    ALWAYS pass the coordinates that should be the search center:
+    - If the user says "near me" or "here", use their GPS.
+    - If they say a city, first call get_coordinates_from_city().
+
+    Args:
+      latitude: center latitude
+      longitude: center longitude
+      radius: search radius in meters (default ~200 miles)
+      amenities_required:
+        - True  -> prioritize truck stops with real-time parking/food/showers
+        - False -> prioritize pure distance / closest stations
+
+    Returns a SHORT list (max 5) of normalized station dictionaries
+    that the LLM can summarize for the user.
+    """
+    print(
+        f"🔎 TOOL CALL: search_amenities ({latitude}, {longitude}) | "
+        f"Amenities Required: {amenities_required}"
+    )
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "radius": radius,
+        "amenitiesType": 1,
+    }
+
     try:
-        headers = build_headers(user_agent, device_os)
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(config.AMENITIES_INFO_API, params=params, headers=headers)
-            resp.raise_for_status()
-            
-            json_res = resp.json()
-            if not json_res.get("success"):
-                return {"error": "Location details unavailable"}
-                
-            data = json_res.get("data") or {} # Safety check 1
-            
-            # 🛑 CRASH FIX: Handle if "parking" key exists but is null
-            parking_data = data.get("parking") or {} 
-            shower_data = data.get("shower") or {}   
-            
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.get(config.AMENITIES_API, params=params, headers=_build_headers())
+            if resp.status_code != 200:
+                return [{"error": "External AMENITIES_API unavailable."}]
+
+            data = resp.json()
+            items = data.get("data", []) if isinstance(data, dict) else data
+
+            results = [
+                _parse_station_data(item, latitude, longitude, amenities_required)
+                for item in items
+            ]
+
+            if amenities_required:
+                # Sort: 1) stations with real-time data first  2) then by distance
+                results.sort(key=lambda x: (not x["is_priority"], x["distance_miles"]))
+                print("✅ Mode: PRIORITY (truck stops with real-time data first)")
+            else:
+                # Sort purely by distance
+                results.sort(key=lambda x: x["distance_miles"])
+                print("✅ Mode: NEAREST (distance first)")
+
+            return results[:5]
+    except Exception as e:
+        return [{"error": f"search_amenities failed: {str(e)}"}]
+
+
+def get_amenities_details(location_id: int, location_cd: str | None = None) -> dict:
+    """
+    Fetch real-time amenities info for a specific station.
+
+    Use this AFTER search_amenities when you want details like:
+      - parking total / available / reserved
+      - shower availability
+      - food text description
+
+    Args:
+      location_id: the station ID from search_amenities() results
+      location_cd: internal location code required by the external API
+
+    Returns a dict with food_options, parking, and showers data.
+    """
+    if not location_cd or not str(location_cd).strip():
+        return {"status": "Unavailable", "reason": "Missing Code"}
+
+    val_to_send = str(location_cd)
+    if len(val_to_send) > 3:
+        val_to_send = val_to_send[1:]
+
+    print(f"🔍 Checking Details | Code: {val_to_send}")
+    params = {"locationId": val_to_send}
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.get(
+                config.AMENITIES_INFO_API, params=params, headers=_build_headers()
+            )
+            data = resp.json().get("data") or {}
+
             return {
-                "site_info": data.get("site"),
+                "location_id": location_id,
+                "food_options": data.get("site", "No food info listed."),
                 "parking": {
-                    "total": parking_data.get("total_spaces"),
-                    "available": parking_data.get("available_spaces")
+                    "total": data.get("parking", {}).get("total_spaces", "?"),
+                    "available": data.get("parking", {}).get("available_spaces", "?"),
+                    "reserved_available": data.get("reserve_it", {}).get(
+                        "available_spaces", 0
+                    ),
                 },
                 "showers": {
-                    "total": shower_data.get("total_showers"),
-                    "available": shower_data.get("available_showers")
-                }
+                    "available": data.get("shower", {}).get(
+                        "available_showers", "?"
+                    )
+                },
             }
-    except Exception as e:
-        print(f"⚠️ Info API Failed: {e}")
-        # Return friendly error so the Agent knows to apologize
-        return {"error": "Real-time info not available for this location."}
+    except Exception:
+        return {"error": "Real-time system offline."}
