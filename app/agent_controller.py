@@ -5,22 +5,13 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from .agent import root_agent  # 👈 import only root_agent now
+from .agent import root_agent
 
-# IMPORTANT: app_name must match the directory name that contains agent.py
-APP_NAME = "app"
+APP_NAME = "app"  # must match package/folder name
 
-# Shared in-memory session service
 _session_service = InMemorySessionService()
+_runner = Runner(agent=root_agent, app_name=APP_NAME, session_service=_session_service)
 
-# Runner built from root_agent + app_name
-_runner = Runner(
-    agent=root_agent,
-    app_name=APP_NAME,
-    session_service=_session_service,
-)
-
-# Simple mapping: user_id -> session_id
 _known_sessions: Dict[str, str] = {}
 
 
@@ -34,7 +25,7 @@ async def _ensure_session(user_id: str) -> str:
     session = await _session_service.create_session(
         app_name=APP_NAME,
         user_id=user_id,
-        session_id=user_id,  # stable ID so user keeps one session
+        session_id=user_id,
     )
     _known_sessions[user_id] = session.id
     print(f"🆕 Created ADK session for user {user_id}: {session.id}")
@@ -45,11 +36,7 @@ async def process_message(
     user_id: str, user_text: str, latitude: float, longitude: float
 ) -> str:
     """
-    Main entry point used by FastAPI.
-
-    - Ensures we have an ADK session for this user.
-    - Wraps GPS + query into a Content message.
-    - Runs the ADK Runner and returns final text.
+    FastAPI entry point: send one user message into the ADK runner, get text back.
     """
     session_id = await _ensure_session(user_id)
 
@@ -59,10 +46,7 @@ async def process_message(
         "If the user says 'near me' or 'here', treat the GPS above as the search center.\n"
     )
 
-    content = types.Content(
-        role="user",
-        parts=[types.Part(text=prompt_text)],
-    )
+    content = types.Content(role="user", parts=[types.Part(text=prompt_text)])
 
     events = _runner.run_async(
         user_id=user_id,
