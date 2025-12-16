@@ -1,21 +1,113 @@
-# tools.py
+# app/tools.py
 import math
+import time
 import httpx
 from . import config
 
 DEFAULT_RADIUS_METERS = 321869  # ~200 miles
 
-# ---------- Helper functions (NOT tools) ----------
+# -----------------------------------------------------------------------------
+# TOKEN MANAGEMENT (OAuth)
+# -----------------------------------------------------------------------------
 
-def _calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+_access_token: str | None = None
+_token_type: str | None = None
+_token_expires_at: float | None = None  # UNIX timestamp
+
+
+def _fetch_new_token() -> tuple[str | None, str | None, float | None]:
     """
-    Internal helper: haversine distance in miles between two lat/lon points.
+    Call the token API to get a new access token.
+    Expected response JSON fields:
+      - access_token
+      - token_type
+      - expires_in (seconds)
+    """
+    if not config.TOKEN_URL:
+        raise ValueError("TOKEN_URL is not set; cannot fetch auth token.")
+
+    # Body required by your token endpoint
+    body = {
+        "client_id": config.TOKEN_CLIENT_ID,
+        "client_secret": config.TOKEN_CLIENT_SECRET,
+        "scope": config.TOKEN_SCOPE,
+        "grant_type": config.TOKEN_GRANT_TYPE,
+    }
+
+    # Basic validation so we fail early if env is misconfigured
+    if not all([config.TOKEN_CLIENT_ID, config.TOKEN_CLIENT_SECRET, config.TOKEN_SCOPE]):
+        raise ValueError(
+            "TOKEN_CLIENT_ID / TOKEN_CLIENT_SECRET / TOKEN_SCOPE must all be set in .env"
+        )
+
+    headers = {
+        "content-type": "application/json",
+    }
+
+    # x-api-key is mandatory for your token API
+    if not config.TOKEN_X_API_KEY:
+        raise ValueError("TOKEN_X_API_KEY is missing in .env but required for token API.")
+    headers["x-api-key"] = config.TOKEN_X_API_KEY
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(config.TOKEN_URL, json=body, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+
+            access_token = data.get("access_token")
+            token_type = data.get("token_type", "Bearer")
+            expires_in = data.get("expires_in", 3600)
+
+            if not access_token:
+                raise ValueError(f"Token response missing 'access_token': {data}")
+
+            # expire slightly earlier than real expiry (safety margin)
+            expires_at = time.time() + int(expires_in) - 60
+
+            print(
+                f"✅ New OAuth token fetched (type={token_type}, "
+                f"expires_in={expires_in}s)"
+            )
+            return access_token, token_type, expires_at
+
+    except Exception as e:
+        print(f"⚠️ Failed to fetch auth token: {e}")
+        return None, None, None
+
+
+def get_auth_token() -> tuple[str | None, str | None]:
+    """
+    Return a valid (access_token, token_type), using cached token when not expired.
+    """
+    global _access_token, _token_type, _token_expires_at
+
+    now = time.time()
+    if _access_token and _token_expires_at and now < _token_expires_at:
+        return _access_token, _token_type
+
+    access_token, token_type, expires_at = _fetch_new_token()
+    if not access_token:
+        return None, None
+
+    _access_token = access_token
+    _token_type = token_type or "Bearer"
+    _token_expires_at = expires_at
+    return _access_token, _token_type
+
+
+# -----------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -----------------------------------------------------------------------------
+
+def _calculate_distance(lat1, lon1, lat2, lon2):
+    """
+    Haversine distance in miles. Returns large number on invalid input.
     """
     if any(x is None for x in [lat1, lon1, lat2, lon2]):
         return 9999.0
-
     try:
-        R = 3958.8  # Earth radius in miles
+        R = 3958.8
         dlat = math.radians(lat2 - lat1)
         dlon = math.radians(lon2 - lon1)
         a = (
@@ -32,20 +124,27 @@ def _calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> f
 
 def _build_headers() -> dict:
     """
-    Internal helper: Build HTTP headers for RXO APIs using env config.
+    Build headers for AMENITIES / AMENITIES_INFO calls.
+
+    - Uses OAuth token from TOKEN_URL (no RXO_BEARER_TOKEN fallback).
+    - Requires RXO_API_KEY for x-apikey.
     """
-    headers = {
+    headers: dict = {
         "accept": "application/json",
+        "content-type": "application/json",
         "user-agent": "FuelFinder/4.0",
         "deviceos": "web",
     }
-    if config.RXO_API_KEY:
-        headers["x-apikey"] = config.RXO_API_KEY
-    if config.RXO_BEARER_TOKEN:
-        token = config.RXO_BEARER_TOKEN
-        headers["authorization"] = (
-            token if token.startswith("Bearer ") else f"Bearer {token}"
-        )
+
+    if not config.RXO_API_KEY:
+        raise ValueError("RXO_API_KEY is missing in .env but required for amenities APIs.")
+    headers["x-apikey"] = config.RXO_API_KEY
+
+    access_token, token_type = get_auth_token()
+    if not access_token:
+        raise ValueError("Failed to get OAuth token; cannot call amenities APIs.")
+
+    headers["authorization"] = f"{token_type or 'Bearer'} {access_token}"
     return headers
 
 
@@ -53,10 +152,9 @@ def _parse_station_data(
     item: dict, user_lat: float, user_lon: float, amenities_requested: bool
 ) -> dict:
     """
-    Internal helper: normalize one station into a compact JSON object.
-    Handles priority sorting and "next step" recommendation text.
+    Normalize a raw amenities-item into a compact object the agents can use.
     """
-    # 1. Parse station coordinates & distance
+    # Coordinates
     station_lat, station_lon = None, None
     geo_str = item.get("locationGeo")
     if geo_str and "," in geo_str:
@@ -69,11 +167,10 @@ def _parse_station_data(
 
     dist = _calculate_distance(user_lat, user_lon, station_lat, station_lon)
 
-    # 2. Real-time capability flag
+    # Real-time capability
     loc_cd = item.get("locationCd")
     has_realtime = bool(loc_cd)
 
-    # 3. Basic “features” + next step hint
     features = []
     next_step = "Basic fuel station."
 
@@ -85,17 +182,18 @@ def _parse_station_data(
                 f"location_id={item.get('locationId')}, location_cd=\"{loc_cd}\")"
             )
         else:
-            next_step = "No real-time amenities data for this station."
+            next_step = "No real-time amenities data available for this station."
     else:
         if has_realtime:
             features.append("Real-time amenities available")
-            next_step = (
-                "Optional: Call get_amenities_details if user asks for specifics."
-            )
+            next_step = "Optional: Call get_amenities_details if user asks for specifics."
 
     return {
         "name": item.get("name"),
-        "is_priority": has_realtime,  # used later for sorting
+        # critical: pass IDs to higher-level agents
+        "location_id": item.get("locationId"),
+        "location_cd": loc_cd,
+        "is_priority": has_realtime,
         "distance_miles": dist,
         "location": f"{item.get('city')}, {item.get('state')}",
         "financials": {
@@ -105,21 +203,16 @@ def _parse_station_data(
         "features": ", ".join(features),
         "maps_url": f"https://www.google.com/maps/search/?api=1&query={station_lat},{station_lon}",
         "NEXT_STEP": next_step,
-        "id": item.get("locationId"),
     }
 
 
-# ---------- ADK Function Tools (these 3 are exposed to the Agent) ----------
+# -----------------------------------------------------------------------------
+# PUBLIC TOOLS (used by agents)
+# -----------------------------------------------------------------------------
 
 def get_coordinates_from_city(city_name: str) -> dict:
     """
-    Convert a city name to GPS coordinates.
-
-    Use this when the user mentions a city like "Chicago" instead of giving
-    raw latitude/longitude. Returns:
-      - latitude (float)
-      - longitude (float)
-      - display_name (string)
+    Convert a city name to latitude/longitude using Nominatim.
     """
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": city_name, "format": "json", "limit": 1}
@@ -147,25 +240,14 @@ def search_amenities(
     amenities_required: bool = False,
 ) -> list[dict]:
     """
-    Search for nearby fuel stations around the given GPS point.
+    Search nearby stations.
 
-    ALWAYS pass the coordinates that should be the search center:
-    - If the user says "near me" or "here", use their GPS.
-    - If they say a city, first call get_coordinates_from_city().
-
-    Args:
-      latitude: center latitude
-      longitude: center longitude
-      radius: search radius in meters (default ~200 miles)
-      amenities_required:
-        - True  -> prioritize truck stops with real-time parking/food/showers
-        - False -> prioritize pure distance / closest stations
-
-    Returns a SHORT list (max 5) of normalized station dictionaries
-    that the LLM can summarize for the user.
+    amenities_required:
+      - True  -> prioritize real-time truck stops
+      - False -> nearest by distance
     """
     print(
-        f"🔎 TOOL CALL: search_amenities ({latitude}, {longitude}) | "
+        f"\n🔎 TOOL CALL: search_amenities ({latitude}, {longitude}) | "
         f"Amenities Required: {amenities_required}"
     )
 
@@ -178,8 +260,13 @@ def search_amenities(
 
     try:
         with httpx.Client(timeout=15.0) as client:
-            resp = client.get(config.AMENITIES_API, params=params, headers=_build_headers())
+            resp = client.get(
+                config.AMENITIES_API,
+                params=params,
+                headers=_build_headers(),
+            )
             if resp.status_code != 200:
+                print("⚠️ AMENITIES_API HTTP", resp.status_code, resp.text)
                 return [{"error": "External AMENITIES_API unavailable."}]
 
             data = resp.json()
@@ -191,33 +278,22 @@ def search_amenities(
             ]
 
             if amenities_required:
-                # Sort: 1) stations with real-time data first  2) then by distance
                 results.sort(key=lambda x: (not x["is_priority"], x["distance_miles"]))
-                print("✅ Mode: PRIORITY (truck stops with real-time data first)")
+                print("✅ Mode: PRIORITY (real-time truck stops first)")
             else:
-                # Sort purely by distance
                 results.sort(key=lambda x: x["distance_miles"])
-                print("✅ Mode: NEAREST (distance first)")
+                print("✅ Mode: NEAREST (distance only)")
 
             return results[:5]
+
     except Exception as e:
-        return [{"error": f"search_amenities failed: {str(e)}"}]
+        print("⚠️ search_amenities exception:", e)
+        return [{"error": str(e)}]
 
 
 def get_amenities_details(location_id: int, location_cd: str | None = None) -> dict:
     """
-    Fetch real-time amenities info for a specific station.
-
-    Use this AFTER search_amenities when you want details like:
-      - parking total / available / reserved
-      - shower availability
-      - food text description
-
-    Args:
-      location_id: the station ID from search_amenities() results
-      location_cd: internal location code required by the external API
-
-    Returns a dict with food_options, parking, and showers data.
+    Fetch real-time amenities for one station.
     """
     if not location_cd or not str(location_cd).strip():
         return {"status": "Unavailable", "reason": "Missing Code"}
@@ -232,8 +308,14 @@ def get_amenities_details(location_id: int, location_cd: str | None = None) -> d
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(
-                config.AMENITIES_INFO_API, params=params, headers=_build_headers()
+                config.AMENITIES_INFO_API,
+                params=params,
+                headers=_build_headers(),
             )
+            if resp.status_code != 200:
+                print("⚠️ AMENITIES_INFO_API HTTP", resp.status_code, resp.text)
+                return {"error": "Real-time system offline."}
+
             data = resp.json().get("data") or {}
 
             return {
@@ -252,5 +334,6 @@ def get_amenities_details(location_id: int, location_cd: str | None = None) -> d
                     )
                 },
             }
-    except Exception:
+    except Exception as e:
+        print("⚠️ get_amenities_details exception:", e)
         return {"error": "Real-time system offline."}

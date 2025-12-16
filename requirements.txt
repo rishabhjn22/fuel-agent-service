@@ -3,7 +3,7 @@ uvicorn[standard]
 httpx
 python-dotenv
 pydantic
-whisper            # your existing transcriber dependency
 torch              # matching whisper
 google-genai       # Google Gen AI Python SDK (pip package)
 python-multipart
+google-adk
