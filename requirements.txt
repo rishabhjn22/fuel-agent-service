@@ -3,7 +3,8 @@ uvicorn[standard]
 httpx
 python-dotenv
 pydantic
-torch              # matching whisper
-google-genai       # Google Gen AI Python SDK (pip package)
+google-genai
 python-multipart
 google-adk
+openai-whisper
+edge-tts

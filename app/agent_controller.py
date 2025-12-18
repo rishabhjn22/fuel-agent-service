@@ -120,7 +120,7 @@ async def process_message(
         parking = details.get("parking", {})
         showers = details.get("showers", {})
         food = details.get("food_options", "N/A")
-        
+
         return (
             f"**{station_name}**\n"
             f"Parking: {parking.get('available', '?')} spots\n"
