@@ -20,7 +20,7 @@ AMENITIES_INFO_API = os.getenv(
 )
 
 # 3) Model name we’ll use with ADK
-GEMINI_MODEL = "gemini-2.5-flash-lite"
+GEMINI_MODEL = "gemini-2.5-flash"
 
 # 4) Make sure ADK / google.genai see GOOGLE_API_KEY
 #    If GOOGLE_API_KEY is not set but GEMINI_API_KEY is, copy it over.

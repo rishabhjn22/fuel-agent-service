@@ -1,13 +1,12 @@
 # main.py
 import uvicorn
-from fastapi import FastAPI, Form
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from pydantic import BaseModel
 from .agent_controller import process_message
 
-app = FastAPI(title="FuelFinder ADK Agent")
+app = FastAPI(title="FuelFinder API")
 
-# 1. Allow calls from your mobile / web frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,32 +14,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ChatRequest(BaseModel):
+    text: str
+    latitude: float
+    longitude: float
+    user_id: str
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
 
 @app.post("/chat")
-async def chat_endpoint(
-    text: str = Form(...),
-    latitude: float = Form(...),
-    longitude: float = Form(...),
-    user_id: str = Form(...),
-):
-    """
-    HTTP endpoint that forwards a single chat turn to the ADK agent runner.
-    """
-    print(f"📩 User {user_id} says: {text}")
-
-    response_text = await process_message(
-        user_id=user_id,
-        user_text=text,
-        latitude=latitude,
-        longitude=longitude,
+async def chat(payload: ChatRequest):
+    response = await process_message(
+        payload.user_id,
+        payload.text,
+        payload.latitude,
+        payload.longitude,
     )
-
-    print(f"🤖 Reply to {user_id}: {response_text}")
-
-    return {"response": response_text}
-
-
-if __name__ == "__main__":
-    # Run local dev server
-    print("🚀 Starting Server on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    return {"response": response}
