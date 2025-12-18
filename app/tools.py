@@ -2,9 +2,27 @@
 import math
 import time
 import httpx
+from typing import List
 from . import config
 
 DEFAULT_RADIUS_METERS = 321869  # ~200 miles
+
+# -----------------------------------------------------------------------------
+# LAST SEARCH RESULTS STORAGE (for follow-up queries)
+# -----------------------------------------------------------------------------
+_last_call_results: List[dict] | None = None
+
+
+def get_last_call_results() -> List[dict] | None:
+    """Get results from the most recent search_amenities call."""
+    return _last_call_results
+
+
+def clear_last_call_results() -> None:
+    """Clear the last call results buffer."""
+    global _last_call_results
+    _last_call_results = None
+
 
 # -----------------------------------------------------------------------------
 # TOKEN MANAGEMENT (OAuth)
@@ -246,6 +264,8 @@ def search_amenities(
       - True  -> prioritize real-time truck stops
       - False -> nearest by distance
     """
+    global _last_call_results
+
     print(
         f"\n🔎 TOOL CALL: search_amenities ({latitude}, {longitude}) | "
         f"Amenities Required: {amenities_required}"
@@ -284,7 +304,14 @@ def search_amenities(
                 results.sort(key=lambda x: x["distance_miles"])
                 print("✅ Mode: NEAREST (distance only)")
 
-            return results[:5]
+            # Return only top 1 station
+            final_results = results[:1]
+
+            # Store in module-level buffer for controller fallback
+            _last_call_results = final_results
+            print(f"💾 Stored {len(final_results)} station(s) in tool buffer")
+
+            return final_results
 
     except Exception as e:
         print("⚠️ search_amenities exception:", e)
